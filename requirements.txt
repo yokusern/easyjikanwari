@@ -1,0 +1,8 @@
+streamlit>=1.32.0
+opencv-python-headless>=4.9.0
+pillow>=10.2.0
+pytesseract>=0.3.10
+icalendar>=5.0.12
+pandas>=2.2.0
+numpy>=1.26.0
+python-dateutil>=2.9.0
