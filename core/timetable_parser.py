@@ -1,19 +1,11 @@
 """
-Parse OCR output into structured schedule data.
-
-Handles two layout types:
-  - "grid"  : Standard weekly timetable (Mon-Fri columns, period rows)
-  - "color" : Yearly/monthly calendar with colored multi-span blocks
-              (typical in nursing/education schools)
+Parse structured schedule data from image analysis or manual input.
 """
 
 import re
 from datetime import date, time, timedelta
 
 import pandas as pd
-
-
-# ── Day / period constants ────────────────────────────────────────────────────
 
 _DAY_MAP: dict[str, int] = {
     "月": 0, "月曜": 0, "月曜日": 0, "MON": 0, "MONDAY": 0,
@@ -30,7 +22,6 @@ _KANJI_NUM: dict[str, int] = {
     "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
 }
 
-# Fallback period times (Japanese standard)
 _DEFAULT_PERIOD_TIMES: dict[int, tuple[time, time]] = {
     1: (time(8, 50), time(10, 20)),
     2: (time(10, 30), time(12, 0)),
@@ -38,55 +29,39 @@ _DEFAULT_PERIOD_TIMES: dict[int, tuple[time, time]] = {
     4: (time(14, 40), time(16, 10)),
     5: (time(16, 20), time(17, 50)),
     6: (time(18, 0), time(19, 30)),
+    7: (time(19, 40), time(21, 10)),
+    8: (time(21, 20), time(22, 50)),
 }
 
 
-# ── Public helpers ────────────────────────────────────────────────────────────
-
 def parse_time_slot(text: str) -> dict:
-    """
-    Parse a time-slot cell.
-    Returns {period, start_time, end_time, raw}.
-    Any field may be None if undetectable.
-    """
-    result = {"period": None, "start_time": None, "end_time": None, "raw": text}
-    text = text.strip()
-
-    # "9:00~10:30" / "9:00-10:30" / "9:00〜10:30"
+    r = {"period": None, "start_time": None, "end_time": None, "raw": text}
     m = re.search(r"(\d{1,2}):(\d{2})\s*[~\-〜～]\s*(\d{1,2}):(\d{2})", text)
     if m:
-        result["start_time"] = time(int(m.group(1)), int(m.group(2)))
-        result["end_time"] = time(int(m.group(3)), int(m.group(4)))
-
-    # "N限" (digit)
+        r["start_time"] = time(int(m.group(1)), int(m.group(2)))
+        r["end_time"]   = time(int(m.group(3)), int(m.group(4)))
     m2 = re.search(r"(\d{1,2})[限時]", text)
     if m2:
         p = int(m2.group(1))
-        result["period"] = p
-        if result["start_time"] is None and p in _DEFAULT_PERIOD_TIMES:
-            result["start_time"], result["end_time"] = _DEFAULT_PERIOD_TIMES[p]
-
-    # "一限" (kanji)
-    if result["period"] is None:
-        for kanji, num in _KANJI_NUM.items():
-            if f"{kanji}限" in text or f"{kanji}時限" in text:
-                result["period"] = num
-                if result["start_time"] is None and num in _DEFAULT_PERIOD_TIMES:
-                    result["start_time"], result["end_time"] = _DEFAULT_PERIOD_TIMES[num]
+        r["period"] = p
+        if r["start_time"] is None and p in _DEFAULT_PERIOD_TIMES:
+            r["start_time"], r["end_time"] = _DEFAULT_PERIOD_TIMES[p]
+    if r["period"] is None:
+        for k, n in _KANJI_NUM.items():
+            if f"{k}限" in text:
+                r["period"] = n
+                if r["start_time"] is None and n in _DEFAULT_PERIOD_TIMES:
+                    r["start_time"], r["end_time"] = _DEFAULT_PERIOD_TIMES[n]
                 break
-
-    # "午前" / "午後"
-    if result["start_time"] is None:
+    if r["start_time"] is None:
         if "午前" in text:
-            result["start_time"], result["end_time"] = time(9, 0), time(12, 0)
+            r["start_time"], r["end_time"] = time(9, 0), time(12, 0)
         elif "午後" in text:
-            result["start_time"], result["end_time"] = time(13, 0), time(17, 0)
-
-    return result
+            r["start_time"], r["end_time"] = time(13, 0), time(17, 0)
+    return r
 
 
 def parse_day_of_week(text: str) -> int | None:
-    """Return 0-6 (Mon-Sun) or None."""
     upper = text.strip().upper()
     for key, val in _DAY_MAP.items():
         if key.upper() in upper:
@@ -95,35 +70,26 @@ def parse_day_of_week(text: str) -> int | None:
 
 
 def parse_specific_date(text: str, default_year: int | None = None) -> date | None:
-    """Parse 'M/D', 'M月D日', etc. Returns date or None."""
     year = default_year or date.today().year
-
     m = re.search(r"(\d{1,2})/(\d{1,2})", text)
     if m:
         try:
             return date(year, int(m.group(1)), int(m.group(2)))
         except ValueError:
             pass
-
     m = re.search(r"(\d{1,2})月(\d{1,2})日", text)
     if m:
         try:
             return date(year, int(m.group(1)), int(m.group(2)))
         except ValueError:
             pass
-
     return None
 
 
 def detect_layout_type(grid_texts: list[list[str]]) -> str:
-    """
-    'weekly'  → header has 月火水木金 style day names
-    'variable'→ header has explicit dates (4/7, 4月7日…)
-    """
     if not grid_texts:
         return "weekly"
     header = " ".join(grid_texts[0])
-
     if re.search(r"\d{1,2}/\d{1,2}", header):
         return "variable"
     if re.search(r"\d{1,2}月\d{1,2}日", header):
@@ -134,38 +100,22 @@ def detect_layout_type(grid_texts: list[list[str]]) -> str:
     return "weekly"
 
 
-# ── Grid-mode parsing ─────────────────────────────────────────────────────────
-
 def parse_grid_schedule(grid_texts: list[list[str]]) -> tuple[pd.DataFrame, list[dict], list[dict]]:
-    """
-    Parse a 2-D grid of OCR text into a structured schedule.
-
-    Returns:
-        df            – DataFrame[row=period_label, col=day/date_label] = class name
-        time_slots    – list of parse_time_slot() results (one per data row)
-        col_headers   – list of {type, day_of_week/date, text} (one per data col)
-    """
     if not grid_texts or len(grid_texts) < 2:
         return pd.DataFrame(), [], []
-
     header_row = grid_texts[0]
-
-    # Build column header metadata
-    col_headers: list[dict] = []
     layout = detect_layout_type(grid_texts)
-
+    col_headers: list[dict] = []
     for i, cell in enumerate(header_row):
         if i == 0:
             col_headers.append({"type": "time_label", "text": cell})
             continue
         if layout == "weekly":
-            col_headers.append({"type": "day", "day_of_week": parse_day_of_week(cell),
-                                 "text": cell})
+            col_headers.append({"type": "day",
+                                 "day_of_week": parse_day_of_week(cell), "text": cell})
         else:
-            col_headers.append({"type": "date", "date": parse_specific_date(cell),
-                                 "text": cell})
-
-    # Parse time-slot column (first column of each data row)
+            col_headers.append({"type": "date",
+                                 "date": parse_specific_date(cell), "text": cell})
     time_slots: list[dict] = []
     data_rows: list[list[str]] = []
     for row in grid_texts[1:]:
@@ -173,29 +123,22 @@ def parse_grid_schedule(grid_texts: list[list[str]]) -> tuple[pd.DataFrame, list
             continue
         time_slots.append(parse_time_slot(row[0]))
         data_rows.append(row[1:] if len(row) > 1 else [])
-
-    # Build row labels
-    row_labels: list[str] = []
+    row_labels = []
     for ts in time_slots:
         if ts["period"]:
-            label = f"{ts['period']}限"
+            lbl = f"{ts['period']}限"
             if ts["start_time"]:
-                label += f" ({ts['start_time'].strftime('%H:%M')})"
+                lbl += f" ({ts['start_time'].strftime('%H:%M')})"
         elif ts["start_time"]:
-            label = ts["start_time"].strftime("%H:%M")
+            lbl = ts["start_time"].strftime("%H:%M")
         else:
-            label = ts["raw"] or "?"
-        row_labels.append(label)
-
-    # Column labels (data columns only, i.e. skip index-0 time label)
+            lbl = ts["raw"] or "?"
+        row_labels.append(lbl)
     col_labels = [h["text"] for h in col_headers[1:]]
-
-    # Normalise row lengths
-    n_cols = max(len(r) for r in data_rows) if data_rows else len(col_labels)
+    n_cols = max((len(r) for r in data_rows), default=len(col_labels))
     for row in data_rows:
         while len(row) < n_cols:
             row.append("")
-
     df = pd.DataFrame(
         data_rows,
         index=row_labels[:len(data_rows)],
@@ -204,55 +147,54 @@ def parse_grid_schedule(grid_texts: list[list[str]]) -> tuple[pd.DataFrame, list
     return df, time_slots, col_headers[1:]
 
 
-# ── Color-block mode parsing ──────────────────────────────────────────────────
-
 def map_blocks_to_schedule(
-    color_blocks: list[dict],
-    img_width: int,
-    img_height: int,
+    blocks: list[dict],
     semester_start: date,
     semester_end: date,
     periods_per_day: int = 6,
+    period_times: dict | None = None,
 ) -> list[dict]:
     """
-    Map detected color blocks to (class_name, start_date, end_date, period) tuples
-    using their relative x/y position in the image.
-
-    This is a heuristic approach: the x position maps linearly to the date
-    range [semester_start … semester_end], and y maps to period 1-N.
-
-    Returns list of event dicts ready for cal_generator.
+    Map color blocks to events using their relative x/y position.
+    Uses the actual bounding box of all blocks (not full image size)
+    for more accurate date/period mapping.
     """
-    if not color_blocks:
+    if not blocks:
         return []
 
-    total_days = (semester_end - semester_start).days + 1
+    pt = period_times or _DEFAULT_PERIOD_TIMES
+
+    min_x = min(b["x"] for b in blocks)
+    max_x = max(b["x"] + b["w"] for b in blocks)
+    min_y = min(b["y"] for b in blocks)
+    max_y = max(b["y"] + b["h"] for b in blocks)
+    x_range = max(max_x - min_x, 1)
+    y_range = max(max_y - min_y, 1)
+    total_days = max((semester_end - semester_start).days, 1)
 
     events = []
-    for block in color_blocks:
-        x, y, w, h = block["x"], block["y"], block["w"], block["h"]
+    for block in blocks:
         name = block.get("text", "").strip()
         if not name:
             continue
 
-        # x → date mapping (linear across image width)
-        start_day_offset = int((x / img_width) * total_days)
-        end_day_offset = int(((x + w) / img_width) * total_days)
-        ev_start = semester_start + timedelta(days=start_day_offset)
-        ev_end = semester_start + timedelta(days=end_day_offset)
+        xs = (block["x"] - min_x) / x_range
+        xe = (block["x"] + block["w"] - min_x) / x_range
+        ev_start = semester_start + timedelta(days=int(xs * total_days))
+        ev_end   = semester_start + timedelta(days=int(xe * total_days))
+        if ev_end < ev_start:
+            ev_end = ev_start
 
-        # y → period mapping (linear across image height)
-        period_idx = int((y / img_height) * periods_per_day) + 1
-        period_idx = max(1, min(period_idx, periods_per_day))
-        ts = _DEFAULT_PERIOD_TIMES.get(period_idx, (time(9, 0), time(10, 30)))
+        yc = (block["y"] + block["h"] / 2 - min_y) / y_range
+        period = max(1, min(int(yc * periods_per_day) + 1, periods_per_day))
+        ts = pt.get(period, (time(9, 0), time(10, 30)))
 
         events.append({
-            "summary": name,
+            "summary":    name,
             "start_date": ev_start,
-            "end_date": ev_end,
+            "end_date":   ev_end,
             "start_time": ts[0],
-            "end_time": ts[1],
-            "period": period_idx,
+            "end_time":   ts[1],
+            "period":     period,
         })
-
     return events

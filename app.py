@@ -1,10 +1,9 @@
 """
 EasyJikanwari — 時間割をカレンダーアプリに自動登録
-スマホ完結 / 完全無料 / API不要
+スマホ完結 / 完全無料 / OCR不要
 """
 
 import base64
-import io
 from datetime import date, time, timedelta
 
 import cv2
@@ -16,28 +15,20 @@ from PIL import Image
 from core.image_processor import (
     auto_detect_mode,
     detect_color_blocks,
+    draw_numbered_blocks,
     detect_grid_cells,
-    enhance_for_ocr,
     extract_cell_img,
     pil_to_bgr,
     sort_to_grid,
 )
-from core.ocr_engine import (
-    is_tesseract_available,
-    ocr_cell,
-    ocr_large_region,
-)
+from core.ocr_engine import is_tesseract_available, ocr_cell
 from core.timetable_parser import (
+    _DEFAULT_PERIOD_TIMES,
     detect_layout_type,
     map_blocks_to_schedule,
     parse_grid_schedule,
-    _DEFAULT_PERIOD_TIMES,
 )
-from core.cal_generator import (
-    df_variable_to_events,
-    events_ics,
-    weekly_ics,
-)
+from core.cal_generator import df_variable_to_events, events_ics, weekly_ics
 
 # ─── Page config ──────────────────────────────────────────────────────────────
 
@@ -48,128 +39,59 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ─── Global CSS ───────────────────────────────────────────────────────────────
-
 st.markdown("""
 <style>
-/* ── Base ── */
 html, body, [data-testid="stAppViewContainer"] {
-    background-color: #F2F2F7 !important;
+    background: #F2F2F7 !important;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
-[data-testid="stHeader"] { background: transparent; }
-[data-testid="stDecoration"] { display: none; }
+[data-testid="stHeader"], [data-testid="stDecoration"] { display: none !important; }
 
-/* ── Card ── */
 .card {
     background: #fff;
     border-radius: 16px;
-    padding: 1.25rem 1.25rem 1rem;
-    margin: 0.6rem 0;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.08);
-}
-
-/* ── Section heading ── */
-.section-title {
-    font-size: 0.72rem;
-    font-weight: 600;
-    color: #8E8E93;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    margin: 1.4rem 0 0.3rem 0.3rem;
-}
-
-/* ── Buttons ── */
-.stButton > button {
-    width: 100%;
-    height: 3.2rem;
-    font-size: 1rem;
-    font-weight: 600;
-    border-radius: 12px;
-    border: none;
-}
-.stButton > button[kind="primary"] {
-    background: #007AFF !important;
-    color: #fff !important;
-}
-.stButton > button[kind="secondary"] {
-    background: #E5E5EA !important;
-    color: #1C1C1E !important;
-}
-.stDownloadButton > button {
-    width: 100%;
-    height: 3.2rem;
-    font-size: 1rem;
-    font-weight: 600;
-    border-radius: 12px;
-    border: none;
-    background: #34C759 !important;
-    color: #fff !important;
-}
-
-/* ── File uploader ── */
-[data-testid="stFileUploader"] {
-    border: 2px dashed #C7C7CC;
-    border-radius: 16px;
-    padding: 0.5rem;
-    background: #fff;
-}
-
-/* ── Radio ── */
-[data-testid="stRadio"] label {
-    font-size: 0.95rem;
-}
-
-/* ── Data editor ── */
-[data-testid="stDataEditor"] {
-    border-radius: 12px;
-    overflow: hidden;
-}
-
-/* ── Alert tweaks ── */
-[data-testid="stAlert"] {
-    border-radius: 12px;
-}
-
-/* ── Export button (custom HTML) ── */
-.export-btn {
-    display: block;
-    text-align: center;
-    background: #34C759;
-    color: #fff !important;
-    padding: 1rem;
-    border-radius: 14px;
-    text-decoration: none !important;
-    font-size: 1.05rem;
-    font-weight: 700;
+    padding: 1.2rem 1.2rem 1rem;
     margin: 0.5rem 0;
-    box-shadow: 0 2px 8px rgba(52,199,89,0.35);
+    box-shadow: 0 1px 6px rgba(0,0,0,0.07);
 }
-.export-btn:hover { background: #28a745; }
-
-/* ── Badge ── */
-.badge {
-    display: inline-block;
-    background: #007AFF;
-    color: #fff;
-    border-radius: 999px;
-    padding: 0.1rem 0.65rem;
-    font-size: 0.78rem;
+.sec {
+    font-size: 0.7rem;
     font-weight: 700;
-    margin-right: 0.4rem;
+    color: #8E8E93;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    margin: 1.3rem 0 0.25rem 0.2rem;
 }
-.badge-green { background: #34C759; }
-.badge-orange { background: #FF9500; }
-
-/* ── Count chip ── */
-.count-chip {
-    display: inline-block;
-    background: #E5E5EA;
-    border-radius: 999px;
-    padding: 0.15rem 0.6rem;
-    font-size: 0.8rem;
-    font-weight: 600;
-    color: #3A3A3C;
+.stButton > button {
+    width: 100%; height: 3.2rem;
+    font-size: 1rem; font-weight: 700;
+    border-radius: 12px; border: none;
+}
+.stButton > button[kind="primary"]   { background:#007AFF!important; color:#fff!important; }
+.stButton > button[kind="secondary"] { background:#E5E5EA!important; color:#1C1C1E!important; }
+.stDownloadButton > button {
+    width: 100%; height: 3.2rem;
+    font-size: 1rem; font-weight: 700;
+    border-radius: 12px; border: none;
+    background: #34C759 !important; color: #fff !important;
+}
+[data-testid="stFileUploader"] {
+    border: 2px dashed #C7C7CC; border-radius: 14px;
+    padding: 0.5rem; background: #fff;
+}
+.export-btn {
+    display: block; text-align: center;
+    background: #34C759; color: #fff !important;
+    padding: 1rem; border-radius: 14px;
+    text-decoration: none !important;
+    font-size: 1.05rem; font-weight: 700;
+    margin: 0.4rem 0;
+    box-shadow: 0 3px 10px rgba(52,199,89,0.3);
+}
+.ok-box {
+    background:#fff; border-radius:16px;
+    padding:1.5rem 1rem; text-align:center;
+    box-shadow:0 1px 6px rgba(0,0,0,0.07);
 }
 </style>
 """, unsafe_allow_html=True)
@@ -177,416 +99,252 @@ html, body, [data-testid="stAppViewContainer"] {
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-def badge(text: str, color: str = "") -> str:
-    cls = f"badge {color}".strip()
-    return f'<span class="{cls}">{text}</span>'
+def sec(t): st.markdown(f'<div class="sec">{t}</div>', unsafe_allow_html=True)
 
-
-def section(title: str):
-    st.markdown(f'<div class="section-title">{title}</div>', unsafe_allow_html=True)
-
-
-def card_open():
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-
-
-def card_close():
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-def ics_html_link(ics_bytes: bytes, filename: str = "timetable.ics") -> str:
-    """
-    Data-URI download link — more reliable than st.download_button on iOS Safari.
-    Tapping this link on iPhone triggers the 'Open in Calendar' dialog directly.
-    """
+def ics_link(ics_bytes: bytes, filename: str = "timetable.ics") -> str:
     b64 = base64.b64encode(ics_bytes).decode()
     return (
         f'<a class="export-btn" '
         f'href="data:text/calendar;charset=utf-8;base64,{b64}" '
-        f'download="{filename}">'
-        f'📲&nbsp;&nbsp;カレンダーアプリに登録する (.ics)</a>'
+        f'download="{filename}">📲&nbsp; カレンダーアプリに登録する</a>'
     )
+
+def period_label(i: int, pt: dict) -> str:
+    ts = pt.get(i)
+    if ts:
+        return f"{i}限　{ts[0].strftime('%H:%M')}〜{ts[1].strftime('%H:%M')}"
+    return f"{i}限"
 
 
 # ─── Header ───────────────────────────────────────────────────────────────────
 
 st.markdown("## 📅 EasyJikanwari")
-st.caption("時間割の画像 → iOSカレンダー・Googleカレンダーに自動登録")
-
-# ─── Tesseract check ──────────────────────────────────────────────────────────
-
-tess_ok = is_tesseract_available()
-if not tess_ok:
-    st.warning(
-        "OCRエンジン（Tesseract）が見つかりません。"
-        "自動認識は使えませんが、手動入力モードは利用可能です。"
-    )
+st.caption("時間割 → カレンダーアプリに登録")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 1 — Upload
+# モード選択
 # ══════════════════════════════════════════════════════════════════════════════
 
-section("STEP 1 　画像をアップロード")
+sec("STEP 1　時間割の種類を選ぶ")
 
-uploaded = st.file_uploader(
-    "時間割の画像を選択（スクリーンショット・写真どちらも対応）",
-    type=["jpg", "jpeg", "png"],
+mode = st.radio(
+    "種類",
+    ["📅 週次時間割（毎週同じ）",
+     "🗓️ 年間・日程カレンダー（看護・教育系など）"],
     label_visibility="collapsed",
 )
-
-if not uploaded:
-    st.markdown("""
-    <div class="card" style="text-align:center;padding:2rem 1rem;color:#8E8E93;">
-        <div style="font-size:2.5rem;margin-bottom:0.5rem;">📷</div>
-        <div style="font-weight:600;color:#3A3A3C;margin-bottom:0.3rem;">
-            時間割の画像を選んでください
-        </div>
-        <div style="font-size:0.85rem;">
-            LINE転送などで画質が落ちた画像にも対応しています
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    st.stop()
-
-img_pil = Image.open(uploaded).convert("RGB")
-img_bgr = pil_to_bgr(img_pil)
-st.image(img_pil, use_column_width=True, caption="アップロードされた画像")
+is_yearly = mode.startswith("🗓️")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — Input method
+# ── 週次モード ─────────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
-section("STEP 2 　入力方法を選択")
+if not is_yearly:
+    sec("STEP 2　時間割を入力する")
+    st.caption("授業名をセルに直接入力してください")
 
-input_method = st.radio(
-    "入力方法",
-    ["🤖 画像から自動認識（OCR）", "✏️ 手動で時間割を入力する"],
-    label_visibility="collapsed",
-    horizontal=False,
-)
-use_ocr = input_method.startswith("🤖")
+    c1, c2 = st.columns(2)
+    with c1:
+        n_days = st.selectbox("曜日数", [5, 6, 7], index=0, key="nd")
+    with c2:
+        n_per  = st.selectbox("時限数", [4, 5, 6, 7, 8], index=2, key="np")
 
-if use_ocr and not tess_ok:
-    st.warning("OCRエンジンが使えないため、手動入力モードに切り替えてください。")
-    st.stop()
+    # Custom period times
+    with st.expander("⏰ 時限の時間を変更する（任意）"):
+        custom_pt: dict[int, tuple[time, time]] = {}
+        defaults = {
+            1:("08:50","10:20"), 2:("10:30","12:00"), 3:("13:00","14:30"),
+            4:("14:40","16:10"), 5:("16:20","17:50"), 6:("18:00","19:30"),
+            7:("19:40","21:10"), 8:("21:20","22:50"),
+        }
+        for i in range(1, n_per + 1):
+            d = defaults.get(i, ("09:00","10:30"))
+            cc1, cc2, cc3 = st.columns([1, 2, 2])
+            with cc1: st.markdown(f"**{i}限**")
+            with cc2: s = st.text_input(f"開始{i}", d[0], label_visibility="collapsed", key=f"s{i}")
+            with cc3: e = st.text_input(f"終了{i}", d[1], label_visibility="collapsed", key=f"e{i}")
+            try:
+                sh, sm = map(int, s.split(":"))
+                eh, em = map(int, e.split(":"))
+                custom_pt[i] = (time(sh, sm), time(eh, em))
+            except Exception:
+                custom_pt[i] = _DEFAULT_PERIOD_TIMES.get(i, (time(9,0), time(10,30)))
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MANUAL INPUT MODE
-# ══════════════════════════════════════════════════════════════════════════════
-
-if not use_ocr:
-    section("STEP 3 　時間割を入力する")
-    st.caption("表のセルをクリックして授業名を入力してください")
-
-    col_left, col_right = st.columns(2)
-    with col_left:
-        n_days = st.selectbox("曜日数", [5, 6, 7], index=0)
-    with col_right:
-        n_periods = st.selectbox("時限数", [4, 5, 6, 7, 8], index=2)
-
-    day_labels_all = ["月", "火", "水", "木", "金", "土", "日"]
-    day_labels = day_labels_all[:n_days]
-
-    period_defaults = {
-        1: ("08:50", "10:20"), 2: ("10:30", "12:00"),
-        3: ("13:00", "14:30"), 4: ("14:40", "16:10"),
-        5: ("16:20", "17:50"), 6: ("18:00", "19:30"),
-        7: ("19:40", "21:10"), 8: ("21:20", "22:50"),
-    }
-
-    period_labels = []
-    for i in range(1, n_periods + 1):
-        d = period_defaults.get(i, ("09:00", "10:30"))
-        period_labels.append(f"{i}限 {d[0]}〜{d[1]}")
-
-    empty = {d: [""] * n_periods for d in day_labels}
-    default_df = pd.DataFrame(empty, index=period_labels)
-
-    manual_df = st.data_editor(
-        default_df,
-        use_container_width=True,
-        num_rows="fixed",
-        key="manual_input",
+    day_names = ["月","火","水","木","金","土","日"][:n_days]
+    prow_labels = [period_label(i, custom_pt or _DEFAULT_PERIOD_TIMES)
+                   for i in range(1, n_per + 1)]
+    empty = pd.DataFrame(
+        [[""] * n_days for _ in range(n_per)],
+        index=prow_labels, columns=day_names
     )
+    df_in = st.data_editor(empty, use_container_width=True, num_rows="fixed", key="week_grid")
 
-    # Convert to time_slots / col_headers format
-    manual_time_slots = []
-    for i in range(1, n_periods + 1):
-        d = period_defaults.get(i, ("09:00", "10:30"))
-        sh, sm = map(int, d[0].split(":"))
-        eh, em = map(int, d[1].split(":"))
-        manual_time_slots.append({
-            "period": i,
-            "start_time": time(sh, sm),
-            "end_time": time(eh, em),
-            "raw": f"{i}限",
-        })
+    sec("STEP 3　学期の期間を設定する")
+    c1, c2 = st.columns(2)
+    with c1: sem_s = st.date_input("開始日", date.today(), key="wss")
+    with c2: sem_e = st.date_input("終了日", date.today()+timedelta(weeks=16), key="wse")
 
-    manual_col_headers = [
-        {"type": "day",
-         "day_of_week": ["月", "火", "水", "木", "金", "土", "日"].index(d),
-         "text": d}
-        for d in day_labels
-    ]
+    if sem_s >= sem_e:
+        st.warning("終了日は開始日より後にしてください")
+        st.stop()
 
-    st.session_state["manual_df"] = manual_df
-    st.session_state["manual_time_slots"] = manual_time_slots
-    st.session_state["manual_col_headers"] = manual_col_headers
-    st.session_state["input_ready"] = True
-    st.session_state["input_mode"] = "manual"
+    if st.button("カレンダーデータを作成する", type="primary", key="wgen"):
+        pt_final = custom_pt or _DEFAULT_PERIOD_TIMES
+        ts_list = [{"period": i,
+                    "start_time": pt_final.get(i, (time(9,0), time(10,30)))[0],
+                    "end_time":   pt_final.get(i, (time(9,0), time(10,30)))[1],
+                    "raw": f"{i}限"}
+                   for i in range(1, n_per + 1)]
+        ch_list = [{"type":"day",
+                    "day_of_week": ["月","火","水","木","金","土","日"].index(d),
+                    "text": d}
+                   for d in day_names]
+        ics_bytes, n_ev = weekly_ics(df_in, ts_list, ch_list, sem_s, sem_e)
+        st.session_state["ics_bytes"] = ics_bytes
+        st.session_state["n_ev"] = n_ev
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OCR MODE
+# ── 年間モード ─────────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
 else:
-    section("STEP 3 　画像を解析する")
-
-    auto_mode = auto_detect_mode(img_bgr)
-    mode_map = {
-        "grid":  "グリッド型（通常の大学の週次時間割）",
-        "color": "カラーブロック型（看護・教育系の年間カレンダー）",
-    }
-
-    detected_label = mode_map[auto_mode]
-    mode_choice = st.radio(
-        "検出された時間割の種類",
-        [f"自動（{detected_label}）", mode_map["grid"], mode_map["color"]],
+    sec("STEP 2　時間割の画像をアップロード")
+    uploaded = st.file_uploader(
+        "スクリーンショットまたは写真",
+        type=["jpg","jpeg","png"],
         label_visibility="collapsed",
+        key="yearly_img",
     )
-    if mode_choice.startswith("自動"):
-        active_mode = auto_mode
-    elif "グリッド" in mode_choice:
-        active_mode = "grid"
-    else:
-        active_mode = "color"
 
-    if st.button("🔍 画像を解析する", type="primary"):
-        st.session_state.pop("input_ready", None)
+    if not uploaded:
+        st.markdown("""
+        <div class="card" style="text-align:center;padding:1.8rem 1rem;color:#8E8E93;">
+          <div style="font-size:2.2rem;margin-bottom:0.4rem;">📷</div>
+          <div style="font-weight:600;color:#3A3A3C;margin-bottom:0.3rem;">画像を選んでください</div>
+          <div style="font-size:0.83rem;">LINE転送などで画質が落ちた画像でも利用できます</div>
+        </div>""", unsafe_allow_html=True)
+        st.stop()
 
-        # ── Grid mode ──────────────────────────────────────────────────────
-        if active_mode == "grid":
-            with st.spinner("表のセルを検出中..."):
-                cells = detect_grid_cells(img_bgr)
+    img_pil = Image.open(uploaded).convert("RGB")
+    img_bgr = pil_to_bgr(img_pil)
 
-            if not cells:
-                st.error("セルを検出できませんでした。カラーブロック型に変更するか、手動入力をお試しください。")
-                st.stop()
+    sec("STEP 3　学年度の期間と時限数を設定する")
+    c1, c2, c3 = st.columns(3)
+    with c1: yr_s = st.number_input("開始年", 2024, 2030, date.today().year, key="yrs")
+    with c2: mo_s = st.number_input("開始月", 1, 12, 4, key="yms")
+    with c3: n_per2 = st.number_input("1日の時限数", 1, 10, 6, key="ynp")
+    try:
+        ay_start = date(int(yr_s), int(mo_s), 1)
+        mo_e = mo_s - 1 if mo_s > 1 else 12
+        yr_e = int(yr_s) + 1 if mo_s > 1 else int(yr_s)
+        # End of the last month of the academic year
+        import calendar as cal_mod
+        last_day = cal_mod.monthrange(yr_e, mo_e)[1]
+        ay_end = date(yr_e, mo_e, last_day)
+    except Exception:
+        st.error("期間の設定が正しくありません")
+        st.stop()
 
-            grid = sort_to_grid(cells)
-            if len(grid) < 2:
-                st.error("行が少なすぎます。手動入力モードを試してください。")
-                st.stop()
+    st.caption(f"学年度: {ay_start.strftime('%Y/%m/%d')} 〜 {ay_end.strftime('%Y/%m/%d')}")
 
-            with st.spinner(f"文字を認識中… ({sum(len(r) for r in grid)} セル)"):
-                prog = st.progress(0)
-                total = sum(len(r) for r in grid)
-                done = 0
-                grid_texts: list[list[str]] = []
-                for row in grid:
-                    row_t = []
-                    for cell in row:
-                        ci = extract_cell_img(img_bgr, cell)
-                        row_t.append(ocr_cell(ci) if ci is not None else "")
-                        done += 1
-                        prog.progress(done / total)
-                    grid_texts.append(row_t)
-                prog.empty()
+    if st.button("🔍 カラーブロックを検出する", type="primary", key="ydet"):
+        with st.spinner("画像からブロックを検出中..."):
+            blocks = detect_color_blocks(img_bgr)
+        if not blocks:
+            st.error("カラーブロックを検出できませんでした。画像を確認してください。")
+            st.stop()
+        st.session_state["blocks"] = blocks
+        st.session_state["img_bgr"] = img_bgr
+        st.session_state["img_pil"] = img_pil
 
-            layout = detect_layout_type(grid_texts)
-            df, time_slots, col_headers = parse_grid_schedule(grid_texts)
+    if "blocks" not in st.session_state:
+        st.stop()
 
-            if df.empty:
-                st.error("時間割を解析できませんでした。手動入力モードをお試しください。")
-                st.stop()
-
-            st.session_state.update({
-                "input_ready": True,
-                "input_mode": "grid",
-                "layout": layout,
-                "df": df,
-                "time_slots": time_slots,
-                "col_headers": col_headers,
-            })
-
-        # ── Color-block mode ────────────────────────────────────────────────
-        else:
-            with st.spinner("カラーブロックを検出中..."):
-                blocks = detect_color_blocks(img_bgr)
-
-            if not blocks:
-                st.error("色付きブロックを検出できませんでした。手動入力モードをお試しください。")
-                st.stop()
-
-            with st.spinner(f"各ブロックの文字を認識中… ({len(blocks)} ブロック)"):
-                prog = st.progress(0)
-                enhanced = enhance_for_ocr(img_bgr, scale=3.0)
-                h, w = img_bgr.shape[:2]
-                for i, block in enumerate(blocks):
-                    sx = enhanced.shape[1] / w
-                    sy = enhanced.shape[0] / h
-                    bx = int(block["x"] * sx); by = int(block["y"] * sy)
-                    bw = int(block["w"] * sx); bh = int(block["h"] * sy)
-                    ih2, iw2 = enhanced.shape[:2]
-                    region = enhanced[
-                        max(by, 0):min(by + bh, ih2),
-                        max(bx, 0):min(bx + bw, iw2),
-                    ]
-                    block["text"] = ocr_large_region(region) if region.size > 0 else ""
-                    prog.progress((i + 1) / len(blocks))
-                prog.empty()
-
-            st.session_state.update({
-                "input_ready": True,
-                "input_mode": "color",
-                "blocks": blocks,
-                "img_shape": img_bgr.shape,
-            })
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 4 — Review / Edit
-# ══════════════════════════════════════════════════════════════════════════════
-
-if not st.session_state.get("input_ready"):
-    st.stop()
-
-section("STEP 4 　内容を確認・修正する")
-st.caption("セルをタップして直接編集できます。OCRのミスはここで直してください。")
-
-mode = st.session_state.get("input_mode")
-
-if mode == "manual":
-    # Already shown above; just pass through
-    df_edit = st.session_state["manual_df"]
-    ts_edit = st.session_state["manual_time_slots"]
-    ch_edit = st.session_state["manual_col_headers"]
-    layout = "weekly"
-
-elif mode == "grid":
-    df = st.session_state["df"]
-    layout = st.session_state["layout"]
-    ts_edit = st.session_state["time_slots"]
-    ch_edit = st.session_state["col_headers"]
-
-    df_edit = st.data_editor(df, use_container_width=True, num_rows="fixed",
-                              key="grid_edit")
-
-elif mode == "color":
     blocks = st.session_state["blocks"]
-    rows = [{"授業名": b.get("text", ""),
-             "幅(週数の目安)": round(b["w"] / img_bgr.shape[1] * 52),
-             "X位置": b["x"], "Y位置": b["y"],
-             "W": b["w"], "H": b["h"]}
-            for b in blocks]
-    blk_df = pd.DataFrame(rows)
-    blk_edited = st.data_editor(
-        blk_df[["授業名", "幅(週数の目安)"]],
+    img_bgr_saved = st.session_state["img_bgr"]
+
+    sec(f"STEP 4　ブロックを確認して授業名を入力する（{len(blocks)} 件検出）")
+
+    numbered_img = draw_numbered_blocks(img_bgr_saved, blocks)
+    st.image(cv2.cvtColor(numbered_img, cv2.COLOR_BGR2RGB),
+             caption="検出されたブロック（番号付き）",
+             use_column_width=True)
+
+    st.caption("上の画像の番号を参照しながら、各ブロックの授業名を入力してください。不要な行は空欄のままでOKです。")
+
+    # Compute estimated date ranges for display
+    min_x = min(b["x"] for b in blocks)
+    max_x = max(b["x"] + b["w"] for b in blocks)
+    x_range = max(max_x - min_x, 1)
+    total_days = max((ay_end - ay_start).days, 1)
+
+    rows = []
+    for i, b in enumerate(blocks):
+        xs = (b["x"] - min_x) / x_range
+        xe = (b["x"] + b["w"] - min_x) / x_range
+        d_s = ay_start + timedelta(days=int(xs * total_days))
+        d_e = ay_start + timedelta(days=int(xe * total_days))
+        rows.append({
+            "No": i + 1,
+            "授業名": b.get("text", ""),
+            "開始日(目安)": d_s.strftime("%m/%d"),
+            "終了日(目安)": d_e.strftime("%m/%d"),
+        })
+
+    edit_df = pd.DataFrame(rows).set_index("No")
+    edited = st.data_editor(
+        edit_df,
         use_container_width=True,
-        key="color_edit",
+        disabled=["開始日(目安)", "終了日(目安)"],
+        key="yearly_edit",
     )
-    for i, row in blk_edited.iterrows():
-        blocks[i]["text"] = row["授業名"]
-    st.session_state["blocks"] = blocks
+
+    # Write back names
+    for idx, row in edited.iterrows():
+        blocks[int(idx) - 1]["text"] = row["授業名"]
+
+    if st.button("カレンダーデータを作成する", type="primary", key="ygen"):
+        ev_list = map_blocks_to_schedule(blocks, ay_start, ay_end, int(n_per2))
+        if not ev_list:
+            st.warning("授業名が入力されているブロックがありません。入力してから再度お試しください。")
+            st.stop()
+        ics_bytes, n_ev = events_ics(ev_list)
+        st.session_state["ics_bytes"] = ics_bytes
+        st.session_state["n_ev"] = n_ev
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 5 — Calendar settings
-# ══════════════════════════════════════════════════════════════════════════════
-
-section("STEP 5 　カレンダーの設定")
-
-ics_bytes: bytes | None = None
-n_events = 0
-
-if mode in ("manual", "grid"):
-    if layout == "weekly":
-        st.write("毎週繰り返す予定を登録します。学期の期間を入力してください。")
-        col1, col2 = st.columns(2)
-        with col1:
-            sem_start = st.date_input("学期開始日", value=date.today(), key="ws")
-        with col2:
-            sem_end = st.date_input("学期終了日",
-                                    value=date.today() + timedelta(weeks=16), key="we")
-
-        if sem_start >= sem_end:
-            st.warning("終了日は開始日より後に設定してください。")
-        else:
-            if st.button("カレンダーデータを作成する", type="primary", key="gen_w"):
-                result = weekly_ics(
-                    df_edit, ts_edit, ch_edit, sem_start, sem_end
-                )
-                ics_bytes, n_events = result
-    else:
-        st.write("日付指定の予定として登録します。")
-        if st.button("カレンダーデータを作成する", type="primary", key="gen_v"):
-            ev_list = df_variable_to_events(df_edit, ts_edit, ch_edit)
-            ics_bytes, n_events = events_ics(ev_list)
-
-elif mode == "color":
-    st.write("ブロックの位置から日付を自動計算します。学年度の期間を入力してください。")
-    col1, col2 = st.columns(2)
-    with col1:
-        sem_start = st.date_input("学年度開始日（例: 4/1）", value=date.today(), key="cs")
-    with col2:
-        yr = date.today().year
-        sem_end = st.date_input("学年度終了日（例: 翌3/31）",
-                                value=date(yr + 1, 3, 31), key="ce")
-    periods = st.number_input("1日の時限数", 1, 10, 6, key="cp")
-
-    if sem_start >= sem_end:
-        st.warning("終了日は開始日より後に設定してください。")
-    else:
-        if st.button("カレンダーデータを作成する", type="primary", key="gen_c"):
-            h, w = st.session_state["img_shape"][:2]
-            ev_list = map_blocks_to_schedule(
-                st.session_state["blocks"], w, h,
-                sem_start, sem_end, int(periods)
-            )
-            ics_bytes, n_events = events_ics(ev_list)
-
-if ics_bytes:
-    st.session_state["ics_bytes"] = ics_bytes
-    st.session_state["n_events"] = n_events
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 6 — Export
+# Export (shared)
 # ══════════════════════════════════════════════════════════════════════════════
 
 if "ics_bytes" not in st.session_state:
     st.stop()
 
-section("STEP 6 　カレンダーに登録する")
+sec("STEP 5　カレンダーに登録する")
 
-n = st.session_state["n_events"]
+n = st.session_state["n_ev"]
 st.markdown(
-    f'<div class="card" style="text-align:center;">'
-    f'<div style="font-size:2.2rem;margin-bottom:0.4rem;">✅</div>'
-    f'<div style="font-weight:700;font-size:1.1rem;color:#1C1C1E;">'
-    f'{n} 件の予定を作成しました</div>'
-    f'</div>',
+    f'<div class="ok-box">'
+    f'<div style="font-size:2rem;margin-bottom:0.3rem;">✅</div>'
+    f'<div style="font-weight:700;font-size:1.05rem;color:#1C1C1E;">'
+    f'{n} 件の予定を作成しました</div></div>',
     unsafe_allow_html=True,
 )
 
-# HTML data-URI link (iOS Safari compatible)
-st.markdown(
-    ics_html_link(st.session_state["ics_bytes"], "timetable.ics"),
-    unsafe_allow_html=True,
-)
+st.markdown(ics_link(st.session_state["ics_bytes"]), unsafe_allow_html=True)
 
-with st.expander("📌 カレンダーへの登録方法"):
+with st.expander("📌 登録方法（iPhone / Google / TimeTree）"):
     st.markdown("""
 **iPhone（iOS標準カレンダー）**
-1. 上の緑ボタンをタップ
+1. 緑のボタンをタップ
 2. 「"カレンダー"で開く」をタップ
 3. 「全てのイベントを追加」→ 完了 ✅
 
-**Googleカレンダー（スマホ）**
-1. 上のボタンからファイルをダウンロード
-2. Googleカレンダーアプリを開く
-3. 設定 → インポート → ダウンロードしたファイルを選択
+**Googleカレンダー**
+- PC: [calendar.google.com](https://calendar.google.com) → 設定 → インポート
+- スマホ: ダウンロード後、Googleカレンダーで共有
 
-**TimeTree**
-1. ファイルをダウンロード
-2. TimeTree → カレンダー設定 → インポート
+**TimeTree / その他**
+- 各アプリの「インポート」機能から .ics を読み込む
 """)
 
 st.divider()
