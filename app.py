@@ -19,7 +19,7 @@ from core.image_processor import (
     group_blocks_by_color,
     pil_to_bgr,
 )
-from core.ocr_engine import assign_ocr_to_groups, load_reader, run_ocr
+from core.ocr_engine import assign_ocr_to_groups
 from core.timetable_parser import DEFAULT_PERIOD_TIMES, groups_to_events
 from core.cal_generator import events_ics
 
@@ -91,11 +91,6 @@ def ics_link(ics_bytes: bytes) -> str:
         f'href="data:text/calendar;charset=utf-8;base64,{b64}" '
         f'download="timetable.ics">📲&nbsp; カレンダーアプリに登録する</a>'
     )
-
-@st.cache_resource(show_spinner=False)
-def get_reader():
-    """Load EasyOCR reader once and cache across sessions."""
-    return load_reader()
 
 # ── Header ─────────────────────────────────────────────────────────────────────
 
@@ -175,10 +170,9 @@ period_times = custom_pt if custom_pt else DEFAULT_PERIOD_TIMES
 # STEP 3 — 検出 + OCR（まとめて実行）
 # ══════════════════════════════════════════════════════════════════════════════
 
-sec("STEP 3　授業ブロックを検出 & 文字認識する")
+sec("STEP 3　授業ブロックを検出する")
 
-if st.button("🔍 ブロック検出 & OCR", type="primary", key="detect"):
-    # ── 色ブロック検出 ──────────────────────────────────────────────────────
+if st.button("🔍 ブロック検出", type="primary", key="detect"):
     with st.spinner("授業ブロックを検出中…"):
         blocks = detect_color_blocks(img_bgr)
         groups = group_blocks_by_color(blocks)
@@ -187,31 +181,19 @@ if st.button("🔍 ブロック検出 & OCR", type="primary", key="detect"):
         st.error("カラーブロックを検出できませんでした。別の画像を試してください。")
         st.stop()
 
-    # ── EasyOCR ────────────────────────────────────────────────────────────
-    with st.spinner("OCRモデルを読み込み中… （初回のみ時間がかかります）"):
-        reader = get_reader()
+    groups = assign_ocr_to_groups([], groups)
 
-    with st.spinner(f"文字を認識中…"):
-        ocr_items = run_ocr(img_bgr, reader, upscale=2.5)
-        groups = assign_ocr_to_groups(ocr_items, groups)
-
-    st.session_state["groups"]     = groups
-    st.session_state["img_bgr"]    = img_bgr
-    st.session_state["ocr_count"]  = len(ocr_items)
+    st.session_state["groups"]  = groups
+    st.session_state["img_bgr"] = img_bgr
 
 if "groups" not in st.session_state:
     st.stop()
 
-groups: list[dict]  = st.session_state["groups"]
-img_bgr_ref         = st.session_state["img_bgr"]
-ocr_count           = st.session_state.get("ocr_count", 0)
+groups: list[dict] = st.session_state["groups"]
+img_bgr_ref        = st.session_state["img_bgr"]
 
 total_blocks = sum(len(g["blocks"]) for g in groups)
-ocr_hit = sum(1 for g in groups if g.get("name_ocr"))
-st.success(
-    f"{len(groups)} 種類の色・{total_blocks} ブロックを検出　／　"
-    f"OCRで {ocr_hit} グループのテキストを認識しました"
-)
+st.success(f"{len(groups)} 種類の色・{total_blocks} ブロックを検出しました")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 4 — 授業名の確認・修正
@@ -225,15 +207,13 @@ st.image(cv2.cvtColor(preview_img, cv2.COLOR_BGR2RGB),
          use_column_width=True)
 
 st.caption(
-    "OCRが自動入力した名前を確認してください。"
-    "間違いはそのまま上書き編集できます。"
+    "各色グループに授業名を入力してください。"
     "「スキップ」は休日・休暇期間などに使ってください。"
 )
 
 for gi, group in enumerate(groups):
     rgb   = group["rgb_css"]
     count = len(group["blocks"])
-    ocr_suggested = group.get("name_ocr", "")
 
     c1, c2, c3 = st.columns([0.45, 3.5, 1.1])
 
@@ -245,18 +225,15 @@ for gi, group in enumerate(groups):
             unsafe_allow_html=True,
         )
     with c2:
-        # OCR候補がある場合はバッジ付きラベルを表示
-        if ocr_suggested:
-            st.markdown(
-                f'<div style="font-size:.75rem;color:#8E8E93;margin-bottom:.1rem;">'
-                f'グループ {gi+1}（{count} ブロック）'
-                f'<span class="ocr-badge">OCR候補</span></div>',
-                unsafe_allow_html=True,
-            )
+        st.markdown(
+            f'<div style="font-size:.75rem;color:#8E8E93;margin-bottom:.1rem;">'
+            f'グループ {gi+1}（{count} ブロック）</div>',
+            unsafe_allow_html=True,
+        )
         name = st.text_input(
             f"g{gi}",
-            value=group.get("name") or ocr_suggested,
-            placeholder=f"グループ {gi+1}（{count} ブロック）の授業名",
+            value=group.get("name", ""),
+            placeholder=f"授業名を入力",
             label_visibility="collapsed",
             key=f"name_{gi}",
         )
