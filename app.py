@@ -201,44 +201,37 @@ st.success(f"{len(groups)} 種類の色・{total_blocks} ブロックを検出�
 
 sec("STEP 4　授業名を確認・修正する")
 
-preview_img = draw_group_preview(img_bgr_ref, groups)
-st.image(cv2.cvtColor(preview_img, cv2.COLOR_BGR2RGB),
-         caption="検出されたブロック（数字 = グループ番号）",
-         use_column_width=True)
+with st.expander("🔍 検出プレビュー（数字 = グループ番号）", expanded=True):
+    preview_img = draw_group_preview(img_bgr_ref, groups)
+    st.image(cv2.cvtColor(preview_img, cv2.COLOR_BGR2RGB), use_column_width=True)
 
-st.caption(
-    "各色グループに授業名を入力してください。"
-    "「スキップ」は休日・休暇期間などに使ってください。"
-)
+st.caption("各色に授業名を入力してください。休日・空きはスキップ。")
+
+# 2列レイアウトでグループを表示
+cols_left, cols_right = st.columns(2)
 
 for gi, group in enumerate(groups):
     rgb   = group["rgb_css"]
     count = len(group["blocks"])
+    col   = cols_left if gi % 2 == 0 else cols_right
 
-    c1, c2, c3 = st.columns([0.45, 3.5, 1.1])
-
-    with c1:
-        st.markdown(
-            f'<div style="width:28px;height:28px;background:{rgb};'
-            f'border-radius:7px;border:1px solid rgba(0,0,0,.12);'
-            f'margin-top:.35rem;"></div>',
-            unsafe_allow_html=True,
+    with col:
+        swatch_label = (
+            f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:2px;">'
+            f'<div style="width:18px;height:18px;background:{rgb};'
+            f'border-radius:4px;border:1px solid rgba(0,0,0,.15);flex-shrink:0;"></div>'
+            f'<span style="font-size:.72rem;color:#8E8E93;">#{gi+1} · {count}ブロック</span>'
+            f'</div>'
         )
-    with c2:
-        st.markdown(
-            f'<div style="font-size:.75rem;color:#8E8E93;margin-bottom:.1rem;">'
-            f'グループ {gi+1}（{count} ブロック）</div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown(swatch_label, unsafe_allow_html=True)
         name = st.text_input(
             f"g{gi}",
             value=group.get("name", ""),
-            placeholder=f"授業名を入力",
+            placeholder="授業名",
             label_visibility="collapsed",
             key=f"name_{gi}",
         )
         group["name"] = name
-    with c3:
         skip = st.checkbox("スキップ", value=group.get("skip", False), key=f"skip_{gi}")
         group["skip"] = skip
 
