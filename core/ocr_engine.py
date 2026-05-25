@@ -1,131 +1,95 @@
 """
-OCR engine with multi-pass preprocessing.
-Handles low-quality / LINE-compressed images by aggressively upscaling
-and applying CLAHE + sharpening before passing to Tesseract.
+OCR engine using EasyOCR.
+
+Strategy:
+  1. Run EasyOCR once on the full (upscaled) image
+  2. For each detected text region, find which color-group block contains it
+  3. Pre-fill group names with the matched text
+  4. User corrects anything wrong in the UI
+
+EasyOCR advantages over pytesseract for this use case:
+  - Handles rotated / vertical text (common in narrow yearly calendar columns)
+  - Better Japanese + English mixed accuracy
+  - No system packages required (pure pip install)
 """
 
 import cv2
 import numpy as np
-import pytesseract
-from PIL import Image
+from collections import Counter
 
 
-# Tesseract configs (Japanese + English, different page-segment modes)
-_CFG_BLOCK = "--oem 3 --psm 6 -l jpn+eng"   # uniform block (multi-line cell)
-_CFG_LINE = "--oem 3 --psm 7 -l jpn+eng"    # single text line (header cell)
-_CFG_SPARSE = "--oem 3 --psm 11 -l jpn+eng"  # sparse text (small noisy cells)
-
-
-def is_tesseract_available() -> bool:
-    try:
-        pytesseract.get_tesseract_version()
-        return True
-    except Exception:
-        return False
-
-
-def _preprocess(cell_bgr: np.ndarray, target_min_dim: int = 80) -> np.ndarray:
+def load_reader():
     """
-    Prepare a single-cell BGR image for OCR:
-      1. Upscale to at least target_min_dim on each side
-      2. CLAHE on L channel (handles uneven lighting)
-      3. Unsharp mask
-      4. Otsu threshold → clean binary image
-      5. White border padding (avoids edge-clip in Tesseract)
+    Load EasyOCR reader (Japanese + English).
+    Call this inside st.cache_resource so the model loads only once.
     """
-    if cell_bgr is None or cell_bgr.size == 0:
-        return None
+    import easyocr  # imported here to avoid loading at module level
+    return easyocr.Reader(["ja", "en"], gpu=False, verbose=False)
 
-    h, w = cell_bgr.shape[:2]
-    if h < 1 or w < 1:
-        return None
 
-    # 1. Upscale
-    scale = max(target_min_dim / h, target_min_dim / w, 2.5)
-    cell_bgr = cv2.resize(cell_bgr,
-                          (max(int(w * scale), 1), max(int(h * scale), 1)),
-                          interpolation=cv2.INTER_CUBIC)
+def run_ocr(img_bgr: np.ndarray, reader, upscale: float = 2.5) -> list[dict]:
+    """
+    Run OCR on the full image and return a list of detected text regions.
 
-    # 2. CLAHE
-    lab = cv2.cvtColor(cell_bgr, cv2.COLOR_BGR2LAB)
+    Each item: {text, confidence, cx, cy}
+    cx/cy are the center coordinates in the ORIGINAL (pre-upscale) image.
+    """
+    h, w = img_bgr.shape[:2]
+
+    # Upscale for better accuracy on small text
+    up = cv2.resize(img_bgr,
+                    (int(w * upscale), int(h * upscale)),
+                    interpolation=cv2.INTER_CUBIC)
+
+    # CLAHE on L channel to improve contrast
+    lab = cv2.cvtColor(up, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-    cell_bgr = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+    l = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(l)
+    up = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
-    # 3. Grayscale + unsharp mask
-    gray = cv2.cvtColor(cell_bgr, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (0, 0), 3)
-    sharp = cv2.addWeighted(gray, 1.5, blur, -0.5, 0)
+    results = reader.readtext(up, detail=1, paragraph=False)
 
-    # 4. Otsu threshold
-    _, binary = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    items = []
+    for (bbox, text, conf) in results:
+        if conf < 0.25 or not text.strip():
+            continue
+        # bbox: [[x1,y1],[x2,y1],[x2,y2],[x1,y2]] in upscaled coords
+        cx_up = sum(pt[0] for pt in bbox) / 4
+        cy_up = sum(pt[1] for pt in bbox) / 4
+        # Map back to original coords
+        cx = cx_up / upscale
+        cy = cy_up / upscale
+        items.append({
+            "text": text.strip(),
+            "confidence": conf,
+            "cx": cx,
+            "cy": cy,
+        })
 
-    # 5. Padding
-    binary = cv2.copyMakeBorder(binary, 15, 15, 15, 15,
-                                 cv2.BORDER_CONSTANT, value=255)
-    return binary
+    return items
 
 
-def ocr_cell(cell_bgr: np.ndarray, mode: str = "block") -> str:
+def assign_ocr_to_groups(ocr_items: list[dict], groups: list[dict]) -> list[dict]:
     """
-    OCR a single cell image.
-    mode: "block" (default) | "line" | "sparse"
-    Returns cleaned text string.
+    For each color group, collect all OCR text whose center falls inside
+    one of the group's blocks. The most frequent text becomes the suggested name.
     """
-    processed = _preprocess(cell_bgr)
-    if processed is None:
-        return ""
+    for group in groups:
+        found_texts: list[str] = []
 
-    pil_img = Image.fromarray(processed)
-    cfg = {"block": _CFG_BLOCK, "line": _CFG_LINE, "sparse": _CFG_SPARSE}.get(
-        mode, _CFG_BLOCK
-    )
+        for item in ocr_items:
+            cx, cy = item["cx"], item["cy"]
+            for block in group["blocks"]:
+                bx, by, bw, bh = block["x"], block["y"], block["w"], block["h"]
+                if bx <= cx <= bx + bw and by <= cy <= by + bh:
+                    found_texts.append(item["text"])
+                    break  # count each OCR item once per group
 
-    try:
-        text = pytesseract.image_to_string(pil_img, config=cfg)
-        return _clean(text)
-    except Exception:
-        return ""
+        if found_texts:
+            # Pick the most common text across all blocks in this group
+            most_common = Counter(found_texts).most_common(1)[0][0]
+            group["name_ocr"] = most_common
+        else:
+            group["name_ocr"] = ""
 
-
-def ocr_cell_best(cell_bgr: np.ndarray) -> str:
-    """
-    Run OCR with multiple configs and return the result with the most content.
-    Use for cells where mode is uncertain (e.g., color blocks in nursing timetables).
-    """
-    results = []
-    for mode in ("block", "sparse"):
-        t = ocr_cell(cell_bgr, mode)
-        if t:
-            results.append(t)
-    if not results:
-        return ""
-    # Prefer the result with more meaningful characters
-    return max(results, key=lambda s: len(s.replace(" ", "").replace("\n", "")))
-
-
-def ocr_large_region(img_bgr: np.ndarray) -> str:
-    """OCR a large image region (e.g., a colored block spanning multiple weeks)."""
-    processed = _preprocess(img_bgr, target_min_dim=120)
-    if processed is None:
-        return ""
-    pil_img = Image.fromarray(processed)
-    try:
-        text = pytesseract.image_to_string(pil_img, config=_CFG_BLOCK)
-        return _clean(text)
-    except Exception:
-        return ""
-
-
-# ── Text cleaning ─────────────────────────────────────────────────────────────
-
-def _clean(text: str) -> str:
-    import re
-    text = text.strip()
-    text = re.sub(r"\n{2,}", "\n", text)   # collapse blank lines
-    text = re.sub(r" {2,}", " ", text)      # collapse spaces
-    # Remove common OCR junk characters
-    text = re.sub(r"[|｜┃│\[\]{}\\]", "", text)
-    text = text.strip()
-    return text
+    return groups

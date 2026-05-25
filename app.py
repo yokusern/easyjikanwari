@@ -19,6 +19,7 @@ from core.image_processor import (
     group_blocks_by_color,
     pil_to_bgr,
 )
+from core.ocr_engine import assign_ocr_to_groups, load_reader, run_ocr
 from core.timetable_parser import DEFAULT_PERIOD_TIMES, groups_to_events
 from core.cal_generator import events_ics
 
@@ -60,14 +61,6 @@ html, body, [data-testid="stAppViewContainer"] {
     border:2px dashed #C7C7CC; border-radius:14px;
     padding:.4rem; background:#fff;
 }
-.swatch-row {
-    display:flex; align-items:center;
-    gap:.6rem; margin:.2rem 0;
-}
-.swatch {
-    width:26px; height:26px; border-radius:7px;
-    border:1px solid rgba(0,0,0,0.12); flex-shrink:0;
-}
 .export-btn {
     display:block; text-align:center;
     background:#34C759; color:#fff!important;
@@ -76,29 +69,20 @@ html, body, [data-testid="stAppViewContainer"] {
     font-size:1.05rem; font-weight:700;
     margin:.4rem 0; box-shadow:0 3px 10px rgba(52,199,89,.3);
 }
-.event-preview {
-    background:#F2F2F7; border-radius:10px;
-    padding:.6rem .8rem; margin:.2rem 0;
-    font-size:.88rem; color:#3A3A3C;
+.ocr-badge {
+    display:inline-block;
+    background:#FF9500; color:#fff;
+    font-size:.65rem; font-weight:700;
+    padding:.1rem .4rem; border-radius:4px;
+    margin-left:.3rem; vertical-align:middle;
 }
 </style>
 """, unsafe_allow_html=True)
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def sec(t: str):
     st.markdown(f'<div class="sec">{t}</div>', unsafe_allow_html=True)
-
-
-def swatch_html(rgb_css: str, count: int) -> str:
-    return (
-        f'<div class="swatch-row">'
-        f'<div class="swatch" style="background:{rgb_css};"></div>'
-        f'<span style="font-size:.82rem;color:#6D6D72;">{count} ブロック</span>'
-        f'</div>'
-    )
-
 
 def ics_link(ics_bytes: bytes) -> str:
     b64 = base64.b64encode(ics_bytes).decode()
@@ -108,6 +92,10 @@ def ics_link(ics_bytes: bytes) -> str:
         f'download="timetable.ics">📲&nbsp; カレンダーアプリに登録する</a>'
     )
 
+@st.cache_resource(show_spinner=False)
+def get_reader():
+    """Load EasyOCR reader once and cache across sessions."""
+    return load_reader()
 
 # ── Header ─────────────────────────────────────────────────────────────────────
 
@@ -145,29 +133,22 @@ img_bgr = pil_to_bgr(img_pil)
 st.image(img_pil, use_column_width=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — 学年度の設定
+# STEP 2 — 学年度設定
 # ══════════════════════════════════════════════════════════════════════════════
 
 sec("STEP 2　学年度・時限の設定")
 
-with st.container():
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        yr_s = st.number_input("開始年", 2024, 2030, date.today().year, key="yrs")
-    with c2:
-        mo_s = st.number_input("開始月", 1, 12, 4, key="yms")
-    with c3:
-        n_per = st.number_input("1日の時限数", 1, 10, 6, key="ynp")
+c1, c2, c3 = st.columns(3)
+with c1: yr_s = st.number_input("開始年", 2024, 2030, date.today().year, key="yrs")
+with c2: mo_s = st.number_input("開始月", 1, 12, 4, key="yms")
+with c3: n_per = st.number_input("1日の時限数", 1, 10, 6, key="ynp")
 
-# Compute academic year end (one month before start, next year)
 mo_e = int(mo_s) - 1 if int(mo_s) > 1 else 12
 yr_e = int(yr_s) + 1 if int(mo_s) > 1 else int(yr_s)
-last_day = cal_mod.monthrange(yr_e, mo_e)[1]
 ay_start = date(int(yr_s), int(mo_s), 1)
-ay_end   = date(yr_e, mo_e, last_day)
+ay_end   = date(yr_e, mo_e, cal_mod.monthrange(yr_e, mo_e)[1])
 st.caption(f"学年度: **{ay_start.strftime('%Y年%m月')}** 〜 **{ay_end.strftime('%Y年%m月')}**")
 
-# Optional: custom period times
 with st.expander("⏰ 時限の時間帯を変更する（任意）"):
     custom_pt: dict[int, tuple[time, time]] = {}
     defaults_str = {
@@ -191,54 +172,71 @@ with st.expander("⏰ 時限の時間帯を変更する（任意）"):
 period_times = custom_pt if custom_pt else DEFAULT_PERIOD_TIMES
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — カラーブロック検出
+# STEP 3 — 検出 + OCR（まとめて実行）
 # ══════════════════════════════════════════════════════════════════════════════
 
-sec("STEP 3　授業ブロックを検出する")
+sec("STEP 3　授業ブロックを検出 & 文字認識する")
 
-if st.button("🔍 ブロックを検出する", type="primary", key="detect"):
-    with st.spinner("画像から授業ブロックを検出中…"):
+if st.button("🔍 ブロック検出 & OCR", type="primary", key="detect"):
+    # ── 色ブロック検出 ──────────────────────────────────────────────────────
+    with st.spinner("授業ブロックを検出中…"):
         blocks = detect_color_blocks(img_bgr)
         groups = group_blocks_by_color(blocks)
 
     if not groups:
-        st.error("カラーブロックを検出できませんでした。別の画像をお試しください。")
+        st.error("カラーブロックを検出できませんでした。別の画像を試してください。")
         st.stop()
 
-    st.session_state["groups"]  = groups
-    st.session_state["img_bgr"] = img_bgr
+    # ── EasyOCR ────────────────────────────────────────────────────────────
+    with st.spinner("OCRモデルを読み込み中… （初回のみ時間がかかります）"):
+        reader = get_reader()
+
+    with st.spinner(f"文字を認識中…"):
+        ocr_items = run_ocr(img_bgr, reader, upscale=2.5)
+        groups = assign_ocr_to_groups(ocr_items, groups)
+
+    st.session_state["groups"]     = groups
+    st.session_state["img_bgr"]    = img_bgr
+    st.session_state["ocr_count"]  = len(ocr_items)
 
 if "groups" not in st.session_state:
     st.stop()
 
-groups: list[dict] = st.session_state["groups"]
-img_bgr_ref = st.session_state["img_bgr"]
+groups: list[dict]  = st.session_state["groups"]
+img_bgr_ref         = st.session_state["img_bgr"]
+ocr_count           = st.session_state.get("ocr_count", 0)
 
 total_blocks = sum(len(g["blocks"]) for g in groups)
-st.success(f"{len(groups)} 種類の色・{total_blocks} ブロックを検出しました")
+ocr_hit = sum(1 for g in groups if g.get("name_ocr"))
+st.success(
+    f"{len(groups)} 種類の色・{total_blocks} ブロックを検出　／　"
+    f"OCRで {ocr_hit} グループのテキストを認識しました"
+)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 4 — 色グループごとに授業名を入力
+# STEP 4 — 授業名の確認・修正
 # ══════════════════════════════════════════════════════════════════════════════
 
-sec("STEP 4　色ごとに授業名を入力する")
+sec("STEP 4　授業名を確認・修正する")
 
-# Show annotated reference image
 preview_img = draw_group_preview(img_bgr_ref, groups)
 st.image(cv2.cvtColor(preview_img, cv2.COLOR_BGR2RGB),
-         caption="検出されたブロック（白枠 = 同じ色グループ、数字 = グループ番号）",
+         caption="検出されたブロック（数字 = グループ番号）",
          use_column_width=True)
 
 st.caption(
-    "上の画像を見ながら、各色グループの授業名を入力してください。"
-    "「スキップ」にチェックすると休日・休暇期間として除外できます。"
+    "OCRが自動入力した名前を確認してください。"
+    "間違いはそのまま上書き編集できます。"
+    "「スキップ」は休日・休暇期間などに使ってください。"
 )
 
 for gi, group in enumerate(groups):
-    rgb = group["rgb_css"]
+    rgb   = group["rgb_css"]
     count = len(group["blocks"])
+    ocr_suggested = group.get("name_ocr", "")
 
     c1, c2, c3 = st.columns([0.45, 3.5, 1.1])
+
     with c1:
         st.markdown(
             f'<div style="width:28px;height:28px;background:{rgb};'
@@ -247,10 +245,18 @@ for gi, group in enumerate(groups):
             unsafe_allow_html=True,
         )
     with c2:
+        # OCR候補がある場合はバッジ付きラベルを表示
+        if ocr_suggested:
+            st.markdown(
+                f'<div style="font-size:.75rem;color:#8E8E93;margin-bottom:.1rem;">'
+                f'グループ {gi+1}（{count} ブロック）'
+                f'<span class="ocr-badge">OCR候補</span></div>',
+                unsafe_allow_html=True,
+            )
         name = st.text_input(
-            f"group_{gi}",
-            value=group.get("name", ""),
-            placeholder=f"グループ {gi+1}　（{count} ブロック）の授業名",
+            f"g{gi}",
+            value=group.get("name") or ocr_suggested,
+            placeholder=f"グループ {gi+1}（{count} ブロック）の授業名",
             label_visibility="collapsed",
             key=f"name_{gi}",
         )
@@ -260,7 +266,7 @@ for gi, group in enumerate(groups):
         group["skip"] = skip
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 5 — カレンダーデータ生成
+# STEP 5 — カレンダー生成 & エクスポート
 # ══════════════════════════════════════════════════════════════════════════════
 
 sec("STEP 5　カレンダーに登録する")
@@ -273,25 +279,19 @@ if labeled == 0:
 st.caption(f"{labeled} 種類の授業が入力済みです")
 
 if st.button("📅 カレンダーデータを作成する", type="primary", key="gen"):
-    ev_list = groups_to_events(
-        groups, ay_start, ay_end,
-        int(n_per), period_times,
-    )
+    ev_list = groups_to_events(groups, ay_start, ay_end, int(n_per), period_times)
     if not ev_list:
         st.warning("予定を作成できませんでした。授業名の入力を確認してください。")
         st.stop()
-
     ics_bytes, n_ev = events_ics(ev_list)
     st.session_state["ics_bytes"] = ics_bytes
-    st.session_state["n_ev"] = n_ev
-    st.session_state["ev_list"] = ev_list
+    st.session_state["n_ev"]      = n_ev
+    st.session_state["ev_list"]   = ev_list
 
 if "ics_bytes" not in st.session_state:
     st.stop()
 
-# ── Preview ────────────────────────────────────────────────────────────────────
-
-n_ev = st.session_state["n_ev"]
+n_ev    = st.session_state["n_ev"]
 ev_list = st.session_state["ev_list"]
 
 st.markdown(
@@ -303,20 +303,16 @@ st.markdown(
 )
 
 with st.expander(f"📋 作成される予定の一覧（最初の20件）"):
-    preview_rows = []
-    for ev in ev_list[:20]:
-        preview_rows.append({
-            "授業名":  ev["summary"],
-            "開始日":  ev["start_date"].strftime("%Y/%m/%d"),
-            "終了日":  ev["end_date"].strftime("%Y/%m/%d"),
-            "開始時刻": ev["start_time"].strftime("%H:%M"),
-            "終了時刻": ev["end_time"].strftime("%H:%M"),
-        })
-    st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+    rows = [{
+        "授業名":  e["summary"],
+        "開始日":  e["start_date"].strftime("%Y/%m/%d"),
+        "終了日":  e["end_date"].strftime("%Y/%m/%d"),
+        "開始時刻": e["start_time"].strftime("%H:%M"),
+        "終了時刻": e["end_time"].strftime("%H:%M"),
+    } for e in ev_list[:20]]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     if n_ev > 20:
         st.caption(f"… 他 {n_ev - 20} 件")
-
-# ── Download ───────────────────────────────────────────────────────────────────
 
 st.markdown(ics_link(st.session_state["ics_bytes"]), unsafe_allow_html=True)
 
@@ -329,7 +325,6 @@ with st.expander("📌 カレンダーへの登録方法"):
 
 **Googleカレンダー**
 - PC: [calendar.google.com](https://calendar.google.com) → 設定 → インポート
-- スマホ: ダウンロードしたファイルをGoogleカレンダーで開く
 
 **TimeTree・その他**
 - 各アプリの「インポート」機能から `.ics` ファイルを読み込む
