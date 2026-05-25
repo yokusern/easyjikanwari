@@ -131,28 +131,25 @@ st.image(img_pil, use_column_width=True)
 # STEP 2 — 学年度設定
 # ══════════════════════════════════════════════════════════════════════════════
 
-sec("STEP 2　学年度・時限の設定")
+sec("STEP 2　学年度を入力する")
 
-c1, c2, c3 = st.columns(3)
-with c1: yr_s = st.number_input("開始年", 2024, 2030, date.today().year, key="yrs")
-with c2: mo_s = st.number_input("開始月", 1, 12, 4, key="yms")
-with c3: n_per = st.number_input("1日の時限数", 1, 10, 6, key="ynp")
+# 4月始まり・3月終わり固定（看護学科の年間時間割形式）
+yr_s = st.number_input("学年度の開始年（例: 2026年度なら 2026）", 2024, 2030, date.today().year, key="yrs")
+yr_s = int(yr_s)
+ay_start = date(yr_s, 4, 1)
+ay_end   = date(yr_s + 1, 3, 31)
+st.caption(f"学年度: **{ay_start.strftime('%Y年4月')}** 〜 **{ay_end.strftime('%Y年3月')}**")
 
-mo_e = int(mo_s) - 1 if int(mo_s) > 1 else 12
-yr_e = int(yr_s) + 1 if int(mo_s) > 1 else int(yr_s)
-ay_start = date(int(yr_s), int(mo_s), 1)
-ay_end   = date(yr_e, mo_e, cal_mod.monthrange(yr_e, mo_e)[1])
-st.caption(f"学年度: **{ay_start.strftime('%Y年%m月')}** 〜 **{ay_end.strftime('%Y年%m月')}**")
+n_per = 6  # 6限固定
 
 with st.expander("⏰ 時限の時間帯を変更する（任意）"):
     custom_pt: dict[int, tuple[time, time]] = {}
     defaults_str = {
         1:("08:50","10:20"), 2:("10:30","12:00"), 3:("13:00","14:30"),
         4:("14:40","16:10"), 5:("16:20","17:50"), 6:("18:00","19:30"),
-        7:("19:40","21:10"), 8:("21:20","22:50"),
     }
-    for i in range(1, int(n_per) + 1):
-        d = defaults_str.get(i, ("09:00","10:30"))
+    for i in range(1, n_per + 1):
+        d = defaults_str[i]
         cc1, cc2, cc3 = st.columns([1, 2, 2])
         with cc1: st.markdown(f"**{i}限**")
         with cc2: s_str = st.text_input(f"s{i}", d[0], label_visibility="collapsed", key=f"ts{i}")
